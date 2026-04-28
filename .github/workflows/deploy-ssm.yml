@@ -1,0 +1,122 @@
+# This workflow will build and push a new container image to Amazon ECR,
+# and then will deploy a new task definition to Amazon ECS, when there is a push to the "main" branch.
+#
+# To use this workflow, you will need to complete the following set-up steps:
+#
+# 1. Create an ECR repository to store your images.
+#    For example: `aws ecr create-repository --repository-name my-ecr-repo --region us-east-2`.
+#    Replace the value of the `ECR_REPOSITORY` environment variable in the workflow below with your repository's name.
+#    Replace the value of the `AWS_REGION` environment variable in the workflow below with your repository's region.
+#
+# 2. Create an ECS task definition, an ECS cluster, and an ECS service.
+#    For example, follow the Getting Started guide on the ECS console:
+#      https://us-east-2.console.aws.amazon.com/ecs/home?region=us-east-2#/firstRun
+#    Replace the value of the `ECS_SERVICE` environment variable in the workflow below with the name you set for the Amazon ECS service.
+#    Replace the value of the `ECS_CLUSTER` environment variable in the workflow below with the name you set for the cluster.
+#
+# 3. Store your ECS task definition as a JSON file in your repository.
+#    The format should follow the output of `aws ecs register-task-definition --generate-cli-skeleton`.
+#    Replace the value of the `ECS_TASK_DEFINITION` environment variable in the workflow below with the path to the JSON file.
+#    Replace the value of the `CONTAINER_NAME` environment variable in the workflow below with the name of the container
+#    in the `containerDefinitions` section of the task definition.
+#
+# 4. Store an IAM user access key in GitHub Actions secrets named `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
+#    See the documentation for each action used below for the recommended IAM policies for this IAM user,
+#    and best practices on handling the access key credentials.
+
+#현재 사용하는 이름
+name: Deploy via SSM
+
+#이벤트 설정 - main branch push event 발생시
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: #수동 실행 버튼
+
+env:
+  AWS_REGION: ap-northeast-2                   # set this to your preferred AWS region, e.g. us-west-1
+  S3_BUCKET:  ha-lab-deploy-bucket-${{ secrets.AWS_ACCOUNT_ID}}
+  ASG_NAME:  ha-lab-asg
+  DEPLOY_DIR:  /var/www/html
+  APP_VERION:  ${{ github.sha}}
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    #1.코드 체크아웃
+    - name: Checkout
+      uses: actions/checkout@v4
+    #2. AWS자격증명 설정
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    #3.
+    - name: Inject version info
+      run: |
+        DEPLOY_TIME=$(date '+%Y-%m-%d-%H:%M KST' + '9 hours')
+        SHORT_SHA="${GITHUB_SHA::7}"
+        sed -i "s/배포버전: [^>]*/배포버전: ${SHORT_SHA} (${DEPLOY_TIME})/" index.html || true
+
+    #4. S3에 배포 패킺디 업로드
+    - name: Upload to S3
+      run: |
+          zip -r deploy-${APP_VERSION}.zip . \
+            --exclude "*.git*" --exclude ".github/*" --exclude "tests/*"
+          aws s3 cp deploy-${APP_VERSION}.zip \
+            s3://${S3_BUCKET}/releases/deploy-${APP_VERSION}.zip
+          aws s3 cp deploy-${APP_VERSION}.zip \
+            s3://${S3_BUCKET}/releases/deploy-latest.zip
+
+    #5. ASG InService 인스터스 ID조회
+    - name: Get ASG instance IDs
+      id: get_instances
+      run: |
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "${ASG_NAME}" \
+            --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
+            --output text | tr '\t' ' ')
+          echo "instance_ids=${INSTANCE_IDS}" >> $GITHUB_OUTPUT
+
+    #6. SSH Run Command로 각 EC2에 순차 배포(Rolling)
+    - name: Deploy via SSM
+      run: |
+        for INSTANCE_ID in ${{ steps.get_instances.outputs.instance_ids }}; do
+          echo "배포 시작: $INSTANCE_ID"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands=["\
+              aws s3 cp s3://${S3_BUCKET}/releases/deploy-${APP_VERSION}.zip /tmp/deploy.zip && \
+              unzip -o /tmp/deploy.zip -d ${DEPLOY_DIR} && \
+              nginx -t && systemctl reload nginx && \
+              curl -sf http://localhost/health\
+            "] \
+            --timeout-seconds 300 \
+            --query Command.CommandId --output text)
+          # 완료 대기 (최대 5분)
+          for i in $(seq 1 30); do
+            sleep 10
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            [ "$STATUS" = "Success" ] && break
+            [ "$STATUS" = "Failed" ] && exit 1
+          done
+          echo "✅ $INSTANCE_ID 배포 완료"
+        done
+    
+
+    #7. ALB 최종 응답 확인
+    - name: Verify via ALB
+      run: |
+          curl -sf --max-time 10 http://${{ secrets.ALB_DNS }} && echo '✅ ALB 정상'
+
+ 
